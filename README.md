@@ -38,12 +38,25 @@ tiny-kernel benchmarks
 Device: Apple M4 Pro
 ========================
 
-RMSNorm [32x4096]: 0.205 ms/iter
-Fused RMSNorm+RoPE+SwiGLU [1x4096->14336]: 82.238 ms/iter
-Flash Attention [heads=32, seq=512, dim=128]: 6.213 ms/iter
+RMSNorm [32x4096]: 0.219 ms/iter
+Matvec [4096x14336]: 2.243 ms/iter (52.4 GFLOPS)
+Naive fused (SLOW) [1x4096->14336]: 80.696 ms/iter
+Split fusion (FAST) [1x4096->14336]: 4.951 ms/iter  ← 16x faster
+Flash Attention [heads=32, seq=512, dim=128]: 5.813 ms/iter
 
 Done.
 ```
+
+## performance reality check
+
+the matvec is memory-bound. 234MB weight matrix at 400GB/s = 0.58ms minimum.
+
+| metric | current | peak | efficiency |
+|--------|---------|------|------------|
+| compute | 52 GFLOPS | 14 TFLOPS | 0.4% |
+| memory | 107 GB/s | 400 GB/s | 27% |
+
+to hit 100x speedup, use INT4 quantization (already implemented) or FP16.
 
 ## the code
 

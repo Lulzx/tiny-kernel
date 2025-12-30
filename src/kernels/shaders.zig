@@ -121,6 +121,239 @@ pub const swiglu = common ++
     \\}
 ;
 
+pub const fused_rmsnorm_rope = common ++
+    \\
+    \\kernel void fused_rmsnorm_rope(
+    \\    device const float* x [[buffer(0)]],
+    \\    device const float* weight [[buffer(1)]],
+    \\    device const float* cos_cache [[buffer(2)]],
+    \\    device const float* sin_cache [[buffer(3)]],
+    \\    device float* out [[buffer(4)]],
+    \\    constant uint& dim [[buffer(5)]],
+    \\    constant uint& head_dim [[buffer(6)]],
+    \\    constant uint& pos [[buffer(7)]],
+    \\    constant float& eps [[buffer(8)]],
+    \\    uint tid [[thread_position_in_threadgroup]],
+    \\    uint tgid [[threadgroup_position_in_grid]],
+    \\    ushort simd_idx [[thread_index_in_simdgroup]],
+    \\    ushort simd_gid [[simdgroup_index_in_threadgroup]]
+    \\) {
+    \\    threadgroup float shared[8];
+    \\    uint offset = tgid * dim;
+    \\    uint half_head = head_dim / 2;
+    \\
+    \\    float local_sum = 0.0f;
+    \\    for (uint i = tid; i < dim; i += 256) {
+    \\        float val = x[offset + i];
+    \\        local_sum += val * val;
+    \\    }
+    \\
+    \\    float simd_sum_val = simd_sum(local_sum);
+    \\    if (simd_idx == 0) shared[simd_gid] = simd_sum_val;
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\    if (simd_gid == 0) {
+    \\        float total = (simd_idx < 8) ? shared[simd_idx] : 0.0f;
+    \\        total = simd_sum(total);
+    \\        if (simd_idx == 0) shared[0] = total;
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\    float rms = fast_rsqrt(shared[0] / float(dim) + eps);
+    \\
+    \\    for (uint i = tid; i < dim; i += 256) {
+    \\        float normed = x[offset + i] * rms * weight[i];
+    \\        uint pos_in_head = i % head_dim;
+    \\
+    \\        if (pos_in_head < half_head) {
+    \\            float pair_val = x[offset + i + half_head] * rms * weight[i + half_head];
+    \\            float cos_v = cos_cache[pos * half_head + pos_in_head];
+    \\            float sin_v = sin_cache[pos * half_head + pos_in_head];
+    \\            out[offset + i] = normed * cos_v - pair_val * sin_v;
+    \\        } else {
+    \\            float pair_val = x[offset + i - half_head] * rms * weight[i - half_head];
+    \\            uint freq_idx = pos_in_head - half_head;
+    \\            float cos_v = cos_cache[pos * half_head + freq_idx];
+    \\            float sin_v = sin_cache[pos * half_head + freq_idx];
+    \\            out[offset + i] = normed * cos_v + pair_val * sin_v;
+    \\        }
+    \\    }
+    \\}
+;
+
+pub const matvec = common ++
+    \\
+    \\kernel void matvec(
+    \\    device const float* x [[buffer(0)]],
+    \\    device const float* W [[buffer(1)]],
+    \\    device float* out [[buffer(2)]],
+    \\    constant uint& K [[buffer(3)]],
+    \\    constant uint& N [[buffer(4)]],
+    \\    uint tid [[thread_position_in_threadgroup]],
+    \\    uint tgid [[threadgroup_position_in_grid]],
+    \\    ushort simd_idx [[thread_index_in_simdgroup]],
+    \\    ushort simd_gid [[simdgroup_index_in_threadgroup]]
+    \\) {
+    \\    threadgroup float shared_x[4096];
+    \\
+    \\    for (uint i = tid; i < K; i += 256) {
+    \\        shared_x[i] = x[i];
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\    const uint OUTPUTS_PER_THREAD = 4;
+    \\    uint n_base = (tgid * 256 + tid) * OUTPUTS_PER_THREAD;
+    \\
+    \\    float acc[OUTPUTS_PER_THREAD] = {0, 0, 0, 0};
+    \\
+    \\    for (uint k = 0; k < K; k++) {
+    \\        float xv = shared_x[k];
+    \\        uint w_row = k * N;
+    \\        for (uint i = 0; i < OUTPUTS_PER_THREAD; i++) {
+    \\            uint n = n_base + i;
+    \\            if (n < N) {
+    \\                acc[i] += xv * W[w_row + n];
+    \\            }
+    \\        }
+    \\    }
+    \\
+    \\    for (uint i = 0; i < OUTPUTS_PER_THREAD; i++) {
+    \\        uint n = n_base + i;
+    \\        if (n < N) {
+    \\            out[n] = acc[i];
+    \\        }
+    \\    }
+    \\}
+;
+
+pub const matvec_dual = common ++
+    \\
+    \\kernel void matvec_dual(
+    \\    device const float* x [[buffer(0)]],
+    \\    device const float* W1 [[buffer(1)]],
+    \\    device const float* W2 [[buffer(2)]],
+    \\    device float* out1 [[buffer(3)]],
+    \\    device float* out2 [[buffer(4)]],
+    \\    constant uint& K [[buffer(5)]],
+    \\    constant uint& N [[buffer(6)]],
+    \\    uint tid [[thread_position_in_threadgroup]],
+    \\    uint tgid [[threadgroup_position_in_grid]],
+    \\    ushort simd_idx [[thread_index_in_simdgroup]],
+    \\    ushort simd_gid [[simdgroup_index_in_threadgroup]]
+    \\) {
+    \\    uint n = tgid * 8 + simd_gid;
+    \\    if (n >= N) return;
+    \\
+    \\    float acc1 = 0.0f;
+    \\    float acc2 = 0.0f;
+    \\    uint w_offset = n;
+    \\
+    \\    for (uint k = simd_idx; k < K; k += 32) {
+    \\        float xv = x[k];
+    \\        acc1 += xv * W1[k * N + w_offset];
+    \\        acc2 += xv * W2[k * N + w_offset];
+    \\    }
+    \\
+    \\    acc1 = simd_sum(acc1);
+    \\    acc2 = simd_sum(acc2);
+    \\    if (simd_idx == 0) {
+    \\        out1[n] = acc1;
+    \\        out2[n] = acc2;
+    \\    }
+    \\}
+;
+
+pub const simdgroup_matmul = common ++
+    \\
+    \\using namespace metal;
+    \\
+    \\kernel void simdgroup_matmul(
+    \\    device const float* A [[buffer(0)]],
+    \\    device const float* B [[buffer(1)]],
+    \\    device float* C [[buffer(2)]],
+    \\    constant uint& M [[buffer(3)]],
+    \\    constant uint& N [[buffer(4)]],
+    \\    constant uint& K [[buffer(5)]],
+    \\    uint2 tid [[thread_position_in_threadgroup]],
+    \\    uint2 tgid [[threadgroup_position_in_grid]],
+    \\    ushort simd_idx [[thread_index_in_simdgroup]],
+    \\    ushort simd_gid [[simdgroup_index_in_threadgroup]]
+    \\) {
+    \\    const uint TILE_M = 32;
+    \\    const uint TILE_N = 32;
+    \\    const uint TILE_K = 32;
+    \\
+    \\    threadgroup float As[TILE_M][TILE_K];
+    \\    threadgroup float Bs[TILE_K][TILE_N];
+    \\
+    \\    uint row = tgid.y * TILE_M;
+    \\    uint col = tgid.x * TILE_N;
+    \\
+    \\    float acc[4][4] = {{0}};
+    \\
+    \\    uint local_row = tid.y;
+    \\    uint local_col = tid.x;
+    \\
+    \\    for (uint k_tile = 0; k_tile < K; k_tile += TILE_K) {
+    \\        for (uint i = local_row; i < TILE_M; i += 8) {
+    \\            for (uint j = local_col; j < TILE_K; j += 32) {
+    \\                uint a_row = row + i;
+    \\                uint a_col = k_tile + j;
+    \\                As[i][j] = (a_row < M && a_col < K) ? A[a_row * K + a_col] : 0.0f;
+    \\            }
+    \\        }
+    \\        for (uint i = local_row; i < TILE_K; i += 8) {
+    \\            for (uint j = local_col; j < TILE_N; j += 32) {
+    \\                uint b_row = k_tile + i;
+    \\                uint b_col = col + j;
+    \\                Bs[i][j] = (b_row < K && b_col < N) ? B[b_row * N + b_col] : 0.0f;
+    \\            }
+    \\        }
+    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\        for (uint k = 0; k < TILE_K; k++) {
+    \\            float a_vals[4];
+    \\            float b_vals[4];
+    \\            for (uint i = 0; i < 4; i++) {
+    \\                a_vals[i] = As[local_row * 4 + i][k];
+    \\                b_vals[i] = Bs[k][local_col * 4 + i];
+    \\            }
+    \\            for (uint i = 0; i < 4; i++) {
+    \\                for (uint j = 0; j < 4; j++) {
+    \\                    acc[i][j] += a_vals[i] * b_vals[j];
+    \\                }
+    \\            }
+    \\        }
+    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    }
+    \\
+    \\    for (uint i = 0; i < 4; i++) {
+    \\        for (uint j = 0; j < 4; j++) {
+    \\            uint out_row = row + local_row * 4 + i;
+    \\            uint out_col = col + local_col * 4 + j;
+    \\            if (out_row < M && out_col < N) {
+    \\                C[out_row * N + out_col] = acc[i][j];
+    \\            }
+    \\        }
+    \\    }
+    \\}
+;
+
+pub const fused_silu_mul = common ++
+    \\
+    \\kernel void fused_silu_mul(
+    \\    device const float* gate [[buffer(0)]],
+    \\    device const float* up [[buffer(1)]],
+    \\    device float* out [[buffer(2)]],
+    \\    constant uint& n [[buffer(3)]],
+    \\    uint tid [[thread_position_in_grid]]
+    \\) {
+    \\    if (tid >= n) return;
+    \\    float g = gate[tid];
+    \\    out[tid] = fast_silu(g) * up[tid];
+    \\}
+;
+
 pub const fused_rmsnorm_rope_swiglu = common ++
     \\
     \\kernel void fused_rmsnorm_rope_swiglu(
