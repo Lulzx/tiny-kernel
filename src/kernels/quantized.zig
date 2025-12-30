@@ -38,10 +38,10 @@ pub const QMatMulInt4 = struct {
         encoder.setBytes(u32, &n, 7);
         encoder.setBytes(u32, &group_size, 8);
 
-        const n_blocks = (n + 15) / 16;
+        const n_blocks = (n + 255) / 256;
         encoder.dispatch(
-            objc.MTLSize.init(n_blocks, m, 1),
-            objc.MTLSize.init(16, 1, 1),
+            objc.MTLSize.init1D(n_blocks),
+            objc.MTLSize.init1D(256),
         );
 
         encoder.endEncoding();

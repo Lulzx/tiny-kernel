@@ -216,6 +216,130 @@ fn benchMatvecDual(device: *tk.Device, iterations: usize) !void {
     std.debug.print("Matvec Dual [{d}x{d}]: {d:.3} ms/iter ({d:.1} GFLOPS)\n", .{ K, N, time_per_iter, gflops });
 }
 
+fn benchInt4Matvec(device: *tk.Device, iterations: usize) !void {
+    const K: usize = 4096;
+    const N: usize = 14336;
+    const M: usize = 1;
+    const group_size: usize = 64;
+
+    var x = try device.createBuffer(f32, M * K);
+    defer x.deinit();
+
+    const packed_size = (K / 2) * N;
+    var w_packed = try device.createBuffer(u8, packed_size);
+    defer w_packed.deinit();
+
+    const num_groups = K / group_size;
+    var scales = try device.createBuffer(f16, num_groups * N);
+    defer scales.deinit();
+
+    var zeros = try device.createBuffer(u8, num_groups * (N / 2));
+    defer zeros.deinit();
+
+    var out = try device.createBuffer(f32, M * N);
+    defer out.deinit();
+
+    for (x.slice()) |*v| v.* = 0.1;
+    for (w_packed.slice()) |*v| v.* = 0x77;
+    for (scales.slice()) |*v| v.* = @as(f16, 0.01);
+    for (zeros.slice()) |*v| v.* = 0x88;
+
+    var qmatmul = try tk.kernels.quantized.QMatMulInt4.init(device);
+
+    for (0..10) |_| {
+        try qmatmul.forward(&x, &w_packed, &scales, &zeros, &out, @intCast(M), @intCast(K), @intCast(N), @intCast(group_size));
+    }
+
+    const timer = Timer.now();
+    for (0..iterations) |_| {
+        try qmatmul.forward(&x, &w_packed, &scales, &zeros, &out, @intCast(M), @intCast(K), @intCast(N), @intCast(group_size));
+    }
+    const elapsed = timer.elapsedMs();
+
+    const time_per_iter = elapsed / @as(f64, @floatFromInt(iterations));
+    const data_mb = @as(f64, @floatFromInt(packed_size + num_groups * N * 2 + num_groups * N / 2)) / (1024.0 * 1024.0);
+    const bandwidth = data_mb / time_per_iter * 1000.0;
+
+    std.debug.print("INT4 Matvec [1x{d}x{d}]: {d:.3} ms/iter ({d:.1} MB, {d:.1} GB/s)\n", .{ K, N, time_per_iter, data_mb, bandwidth / 1024.0 });
+}
+
+fn benchFusedInt4(device: *tk.Device, iterations: usize) !void {
+    const hidden_dim: usize = 4096;
+    const inter_dim: usize = 14336;
+    const head_dim: usize = 128;
+    const batch: usize = 1;
+    const max_seq: usize = 8192;
+    const group_size: usize = 64;
+
+    var x = try device.createBuffer(f32, batch * hidden_dim);
+    defer x.deinit();
+    var norm_weight = try device.createBuffer(f32, hidden_dim);
+    defer norm_weight.deinit();
+    var cos_cache = try device.createBuffer(f32, max_seq * head_dim / 2);
+    defer cos_cache.deinit();
+    var sin_cache = try device.createBuffer(f32, max_seq * head_dim / 2);
+    defer sin_cache.deinit();
+    var normed = try device.createBuffer(f32, batch * hidden_dim);
+    defer normed.deinit();
+
+    const packed_size = (hidden_dim / 2) * inter_dim;
+    const num_groups = hidden_dim / group_size;
+
+    var gate_packed = try device.createBuffer(u8, packed_size);
+    defer gate_packed.deinit();
+    var gate_scales = try device.createBuffer(f16, num_groups * inter_dim);
+    defer gate_scales.deinit();
+    var gate_zeros = try device.createBuffer(u8, num_groups * (inter_dim / 2));
+    defer gate_zeros.deinit();
+
+    var up_packed = try device.createBuffer(u8, packed_size);
+    defer up_packed.deinit();
+    var up_scales = try device.createBuffer(f16, num_groups * inter_dim);
+    defer up_scales.deinit();
+    var up_zeros = try device.createBuffer(u8, num_groups * (inter_dim / 2));
+    defer up_zeros.deinit();
+
+    var gate_out = try device.createBuffer(f32, batch * inter_dim);
+    defer gate_out.deinit();
+    var up_out = try device.createBuffer(f32, batch * inter_dim);
+    defer up_out.deinit();
+    var out = try device.createBuffer(f32, batch * inter_dim);
+    defer out.deinit();
+
+    for (x.slice()) |*v| v.* = 0.1;
+    for (norm_weight.slice()) |*v| v.* = 1.0;
+    for (cos_cache.slice()) |*v| v.* = 1.0;
+    for (sin_cache.slice()) |*v| v.* = 0.0;
+    for (gate_packed.slice()) |*v| v.* = 0x77;
+    for (gate_scales.slice()) |*v| v.* = @as(f16, 0.01);
+    for (gate_zeros.slice()) |*v| v.* = 0x88;
+    for (up_packed.slice()) |*v| v.* = 0x77;
+    for (up_scales.slice()) |*v| v.* = @as(f16, 0.01);
+    for (up_zeros.slice()) |*v| v.* = 0x88;
+
+    var fused_norm_rope = try tk.kernels.fused.FusedRMSNormRoPE.init(device);
+    var qmatmul = try tk.kernels.quantized.QMatMulInt4.init(device);
+    var silu_mul = try tk.kernels.fused.FusedSiluMul.init(device);
+
+    for (0..10) |_| {
+        try fused_norm_rope.forward(&x, &norm_weight, &cos_cache, &sin_cache, &normed, @intCast(hidden_dim), @intCast(head_dim), 0, 1e-6);
+        try qmatmul.forward(&normed, &gate_packed, &gate_scales, &gate_zeros, &gate_out, 1, @intCast(hidden_dim), @intCast(inter_dim), @intCast(group_size));
+        try qmatmul.forward(&normed, &up_packed, &up_scales, &up_zeros, &up_out, 1, @intCast(hidden_dim), @intCast(inter_dim), @intCast(group_size));
+        try silu_mul.forward(&gate_out, &up_out, &out);
+    }
+
+    const timer = Timer.now();
+    for (0..iterations) |_| {
+        try fused_norm_rope.forward(&x, &norm_weight, &cos_cache, &sin_cache, &normed, @intCast(hidden_dim), @intCast(head_dim), 0, 1e-6);
+        try qmatmul.forward(&normed, &gate_packed, &gate_scales, &gate_zeros, &gate_out, 1, @intCast(hidden_dim), @intCast(inter_dim), @intCast(group_size));
+        try qmatmul.forward(&normed, &up_packed, &up_scales, &up_zeros, &up_out, 1, @intCast(hidden_dim), @intCast(inter_dim), @intCast(group_size));
+        try silu_mul.forward(&gate_out, &up_out, &out);
+    }
+    const elapsed = timer.elapsedMs();
+
+    std.debug.print("INT4 Fused FFN [{d}x{d}->{d}]: {d:.3} ms/iter\n", .{ batch, hidden_dim, inter_dim, elapsed / @as(f64, @floatFromInt(iterations)) });
+}
+
 fn benchFlashAttention(device: *tk.Device, iterations: usize) !void {
     const seq_len: usize = 512;
     const head_dim: usize = 128;
@@ -261,9 +385,12 @@ pub fn main() !void {
 
     try benchRMSNorm(device, iterations);
     try benchMatvec(device, iterations);
-    try benchMatvecDual(device, iterations);
+    try benchInt4Matvec(device, iterations);
+    std.debug.print("\n", .{});
     try benchFusedSlow(device, iterations);
     try benchFusedFast(device, iterations);
+    try benchFusedInt4(device, iterations);
+    std.debug.print("\n", .{});
     try benchFlashAttention(device, iterations);
 
     std.debug.print("\nDone.\n", .{});

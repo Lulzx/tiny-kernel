@@ -449,35 +449,52 @@ pub const qmatmul_int4 = common ++
     \\    constant uint& K [[buffer(6)]],
     \\    constant uint& N [[buffer(7)]],
     \\    constant uint& group_size [[buffer(8)]],
-    \\    uint2 tid [[thread_position_in_threadgroup]],
-    \\    uint2 tgid [[threadgroup_position_in_grid]]
+    \\    uint tid [[thread_position_in_threadgroup]],
+    \\    uint tgid [[threadgroup_position_in_grid]]
     \\) {
-    \\    uint m = tgid.y;
-    \\    uint n_base = tgid.x * 16;
-    \\    uint n = n_base + tid.x;
+    \\    threadgroup float shared_x[4096];
     \\
-    \\    if (m >= M || n >= N) return;
+    \\    for (uint i = tid; i < K; i += 256) {
+    \\        shared_x[i] = x[i];
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\    uint n = tgid * 256 + tid;
+    \\    if (n >= N) return;
+    \\
+    \\    uint zero_byte_idx = n / 2;
+    \\    int zero_shift = (n % 2) * 4;
     \\
     \\    float acc = 0.0f;
-    \\    uint x_offset = m * K;
+    \\    uint num_groups = K / group_size;
     \\
-    \\    for (uint k = 0; k < K; k++) {
-    \\        uint byte_idx = (k / 2) * N + n;
-    \\        uchar packed = w_packed[byte_idx];
-    \\        int w_int = (k % 2 == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+    \\    for (uint g = 0; g < num_groups; g++) {
+    \\        float scale = float(scales[g * N + n]);
+    \\        uchar zero_packed = zeros[g * (N / 2) + zero_byte_idx];
+    \\        float fzero = float((zero_packed >> zero_shift) & 0x0F);
     \\
-    \\        uint group = k / group_size;
-    \\        float scale = float(scales[group * N + n]);
+    \\        uint k_base = g * group_size;
+    \\        device const uchar* w_row = w_packed + n;
     \\
-    \\        uint zero_byte_idx = group * (N / 2) + n / 2;
-    \\        uchar zero_packed = zeros[zero_byte_idx];
-    \\        int zero = (n % 2 == 0) ? (zero_packed & 0x0F) : ((zero_packed >> 4) & 0x0F);
+    \\        for (uint i = 0; i < group_size; i += 8) {
+    \\            uint k = k_base + i;
+    \\            uchar p0 = w_row[(k/2) * N];
+    \\            uchar p1 = w_row[(k/2 + 1) * N];
+    \\            uchar p2 = w_row[(k/2 + 2) * N];
+    \\            uchar p3 = w_row[(k/2 + 3) * N];
     \\
-    \\        float w_float = scale * float(w_int - zero);
-    \\        acc += x[x_offset + k] * w_float;
+    \\            acc += shared_x[k] * scale * (float(p0 & 0x0F) - fzero);
+    \\            acc += shared_x[k+1] * scale * (float((p0 >> 4) & 0x0F) - fzero);
+    \\            acc += shared_x[k+2] * scale * (float(p1 & 0x0F) - fzero);
+    \\            acc += shared_x[k+3] * scale * (float((p1 >> 4) & 0x0F) - fzero);
+    \\            acc += shared_x[k+4] * scale * (float(p2 & 0x0F) - fzero);
+    \\            acc += shared_x[k+5] * scale * (float((p2 >> 4) & 0x0F) - fzero);
+    \\            acc += shared_x[k+6] * scale * (float(p3 & 0x0F) - fzero);
+    \\            acc += shared_x[k+7] * scale * (float((p3 >> 4) & 0x0F) - fzero);
+    \\        }
     \\    }
     \\
-    \\    out[m * N + n] = acc;
+    \\    out[n] = acc;
     \\}
 ;
 

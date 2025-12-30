@@ -38,25 +38,34 @@ tiny-kernel benchmarks
 Device: Apple M4 Pro
 ========================
 
-RMSNorm [32x4096]: 0.219 ms/iter
-Matvec [4096x14336]: 2.243 ms/iter (52.4 GFLOPS)
-Naive fused (SLOW) [1x4096->14336]: 80.696 ms/iter
-Split fusion (FAST) [1x4096->14336]: 4.951 ms/iter  ← 16x faster
-Flash Attention [heads=32, seq=512, dim=128]: 5.813 ms/iter
+RMSNorm [32x4096]: 0.235 ms/iter
+Matvec [4096x14336]: 2.234 ms/iter (52.6 GFLOPS)
+INT4 Matvec [1x4096x14336]: 0.420 ms/iter (70.2 GB/s)
+
+Naive fused (SLOW) [1x4096->14336]: 81.095 ms/iter
+Split fusion (FAST) [1x4096->14336]: 5.037 ms/iter  ← 16x faster
+INT4 Fused FFN [1x4096->14336]: 1.302 ms/iter       ← 62x faster
+
+Flash Attention [heads=32, seq=512, dim=128]: 5.924 ms/iter
 
 Done.
 ```
 
 ## performance reality check
 
-the matvec is memory-bound. 234MB weight matrix at 400GB/s = 0.58ms minimum.
+| operation | naive | optimized | speedup |
+|-----------|-------|-----------|---------|
+| FFN (FP32) | 81ms | 5.0ms | 16x |
+| FFN (INT4) | 81ms | 1.3ms | **62x** |
 
-| metric | current | peak | efficiency |
-|--------|---------|------|------------|
-| compute | 52 GFLOPS | 14 TFLOPS | 0.4% |
-| memory | 107 GB/s | 400 GB/s | 27% |
+the matvec is memory-bound. INT4 helps because 4x less data to move.
 
-to hit 100x speedup, use INT4 quantization (already implemented) or FP16.
+| metric | FP32 matvec | INT4 matvec | peak |
+|--------|-------------|-------------|------|
+| bandwidth | 107 GB/s | 70 GB/s | 400 GB/s |
+| efficiency | 27% | 18% | 100% |
+
+INT4 is slightly lower efficiency due to strided access pattern, but 4x less data wins.
 
 ## the code
 
