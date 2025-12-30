@@ -105,4 +105,4 @@ fused kernel:
 
 ## license
 
-mit. do whatever you want. just ship something.
+WTFPL. do what the fuck you want. just ship something.
