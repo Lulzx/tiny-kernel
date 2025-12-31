@@ -194,6 +194,8 @@ pub const matvec = common ++
     \\    ushort simd_idx [[thread_index_in_simdgroup]],
     \\    ushort simd_gid [[simdgroup_index_in_threadgroup]]
     \\) {
+    \\    // W is stored as (N, K) = (out_dim, in_dim) in row-major
+    \\    // out[n] = sum_k(W[n * K + k] * x[k])
     \\    threadgroup float shared_x[4096];
     \\
     \\    for (uint i = tid; i < K; i += 256) {
@@ -206,13 +208,12 @@ pub const matvec = common ++
     \\
     \\    float acc[OUTPUTS_PER_THREAD] = {0, 0, 0, 0};
     \\
-    \\    for (uint k = 0; k < K; k++) {
-    \\        float xv = shared_x[k];
-    \\        uint w_row = k * N;
-    \\        for (uint i = 0; i < OUTPUTS_PER_THREAD; i++) {
-    \\            uint n = n_base + i;
-    \\            if (n < N) {
-    \\                acc[i] += xv * W[w_row + n];
+    \\    for (uint i = 0; i < OUTPUTS_PER_THREAD; i++) {
+    \\        uint n = n_base + i;
+    \\        if (n < N) {
+    \\            uint w_row = n * K;
+    \\            for (uint k = 0; k < K; k++) {
+    \\                acc[i] += shared_x[k] * W[w_row + k];
     \\            }
     \\        }
     \\    }
@@ -241,17 +242,18 @@ pub const matvec_dual = common ++
     \\    ushort simd_idx [[thread_index_in_simdgroup]],
     \\    ushort simd_gid [[simdgroup_index_in_threadgroup]]
     \\) {
+    \\    // W is stored as (N, K) = (out_dim, in_dim) in row-major
     \\    uint n = tgid * 8 + simd_gid;
     \\    if (n >= N) return;
     \\
     \\    float acc1 = 0.0f;
     \\    float acc2 = 0.0f;
-    \\    uint w_offset = n;
+    \\    uint w_row = n * K;
     \\
     \\    for (uint k = simd_idx; k < K; k += 32) {
     \\        float xv = x[k];
-    \\        acc1 += xv * W1[k * N + w_offset];
-    \\        acc2 += xv * W2[k * N + w_offset];
+    \\        acc1 += xv * W1[w_row + k];
+    \\        acc2 += xv * W2[w_row + k];
     \\    }
     \\
     \\    acc1 = simd_sum(acc1);
@@ -788,6 +790,235 @@ pub const flash_attention_fwd = common ++
     \\        if (d < head_dim) {
     \\            O[out_offset + d] = acc[i] * inv_sum;
     \\        }
+    \\    }
+    \\}
+;
+
+pub const embedding_lookup = common ++
+    \\
+    \\kernel void embedding_lookup(
+    \\    device const float* embed_table [[buffer(0)]],
+    \\    device const uint* token_id [[buffer(1)]],
+    \\    device float* out [[buffer(2)]],
+    \\    constant uint& dim [[buffer(3)]],
+    \\    uint tid [[thread_position_in_grid]]
+    \\) {
+    \\    if (tid >= dim) return;
+    \\    uint tok = token_id[0];
+    \\    out[tid] = embed_table[tok * dim + tid];
+    \\}
+;
+
+pub const elementwise_add = common ++
+    \\
+    \\kernel void elementwise_add(
+    \\    device const float* a [[buffer(0)]],
+    \\    device const float* b [[buffer(1)]],
+    \\    device float* out [[buffer(2)]],
+    \\    constant uint& n [[buffer(3)]],
+    \\    uint tid [[thread_position_in_grid]]
+    \\) {
+    \\    if (tid >= n) return;
+    \\    out[tid] = a[tid] + b[tid];
+    \\}
+;
+
+pub const softmax_sample = common ++
+    \\
+    \\kernel void softmax_sample(
+    \\    device const float* logits [[buffer(0)]],
+    \\    device float* probs [[buffer(1)]],
+    \\    device uint* sampled [[buffer(2)]],
+    \\    constant uint& vocab_size [[buffer(3)]],
+    \\    constant float& temperature [[buffer(4)]],
+    \\    constant float& random_val [[buffer(5)]],
+    \\    uint tid [[thread_position_in_threadgroup]],
+    \\    ushort simd_idx [[thread_index_in_simdgroup]],
+    \\    ushort simd_gid [[simdgroup_index_in_threadgroup]]
+    \\) {
+    \\    threadgroup float shared[8];
+    \\
+    \\    float inv_temp = 1.0f / temperature;
+    \\
+    \\    float local_max = -INFINITY;
+    \\    for (uint i = tid; i < vocab_size; i += 256) {
+    \\        local_max = max(local_max, logits[i] * inv_temp);
+    \\    }
+    \\    float simd_max_val = simd_max(local_max);
+    \\    if (simd_idx == 0) shared[simd_gid] = simd_max_val;
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\    if (simd_gid == 0) {
+    \\        float total = (simd_idx < 8) ? shared[simd_idx] : -INFINITY;
+    \\        total = simd_max(total);
+    \\        if (simd_idx == 0) shared[0] = total;
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    float max_val = shared[0];
+    \\
+    \\    float local_sum = 0.0f;
+    \\    for (uint i = tid; i < vocab_size; i += 256) {
+    \\        local_sum += exp(logits[i] * inv_temp - max_val);
+    \\    }
+    \\    float simd_sum_val = simd_sum(local_sum);
+    \\    if (simd_idx == 0) shared[simd_gid] = simd_sum_val;
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\    if (simd_gid == 0) {
+    \\        float total = (simd_idx < 8) ? shared[simd_idx] : 0.0f;
+    \\        total = simd_sum(total);
+    \\        if (simd_idx == 0) shared[0] = total;
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    float sum_exp = shared[0];
+    \\
+    \\    for (uint i = tid; i < vocab_size; i += 256) {
+    \\        probs[i] = exp(logits[i] * inv_temp - max_val) / sum_exp;
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\    if (tid == 0) {
+    \\        float cumsum = 0.0f;
+    \\        for (uint i = 0; i < vocab_size; i++) {
+    \\            cumsum += probs[i];
+    \\            if (random_val < cumsum) {
+    \\                sampled[0] = i;
+    \\                return;
+    \\            }
+    \\        }
+    \\        sampled[0] = vocab_size - 1;
+    \\    }
+    \\}
+;
+
+pub const argmax = common ++
+    \\
+    \\kernel void argmax(
+    \\    device const float* x [[buffer(0)]],
+    \\    device uint* out [[buffer(1)]],
+    \\    constant uint& n [[buffer(2)]],
+    \\    uint tid [[thread_position_in_threadgroup]],
+    \\    ushort simd_idx [[thread_index_in_simdgroup]],
+    \\    ushort simd_gid [[simdgroup_index_in_threadgroup]]
+    \\) {
+    \\    threadgroup float shared_val[8];
+    \\    threadgroup uint shared_idx[8];
+    \\
+    \\    float local_max = -INFINITY;
+    \\    uint local_idx = 0;
+    \\    for (uint i = tid; i < n; i += 256) {
+    \\        if (x[i] > local_max) {
+    \\            local_max = x[i];
+    \\            local_idx = i;
+    \\        }
+    \\    }
+    \\
+    \\    for (uint offset = 16; offset > 0; offset /= 2) {
+    \\        float other_val = simd_shuffle_down(local_max, offset);
+    \\        uint other_idx = simd_shuffle_down(local_idx, offset);
+    \\        if (other_val > local_max) {
+    \\            local_max = other_val;
+    \\            local_idx = other_idx;
+    \\        }
+    \\    }
+    \\
+    \\    if (simd_idx == 0) {
+    \\        shared_val[simd_gid] = local_max;
+    \\        shared_idx[simd_gid] = local_idx;
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\    if (tid == 0) {
+    \\        float best_val = -INFINITY;
+    \\        uint best_idx = 0;
+    \\        for (uint i = 0; i < 8; i++) {
+    \\            if (shared_val[i] > best_val) {
+    \\                best_val = shared_val[i];
+    \\                best_idx = shared_idx[i];
+    \\            }
+    \\        }
+    \\        out[0] = best_idx;
+    \\    }
+    \\}
+;
+
+pub const causal_attention = common ++
+    \\
+    \\kernel void causal_attention(
+    \\    device const float* q [[buffer(0)]],
+    \\    device const float* k_cache [[buffer(1)]],
+    \\    device const float* v_cache [[buffer(2)]],
+    \\    device float* out [[buffer(3)]],
+    \\    constant uint& head_dim [[buffer(4)]],
+    \\    constant uint& seq_pos [[buffer(5)]],
+    \\    constant uint& max_seq [[buffer(6)]],
+    \\    constant float& scale [[buffer(7)]],
+    \\    uint tid [[thread_position_in_threadgroup]],
+    \\    uint tgid [[threadgroup_position_in_grid]],
+    \\    ushort simd_idx [[thread_index_in_simdgroup]],
+    \\    ushort simd_gid [[simdgroup_index_in_threadgroup]]
+    \\) {
+    \\    uint head = tgid;
+    \\    uint kv_len = seq_pos + 1;
+    \\
+    \\    threadgroup float shared_scores[2048];
+    \\    threadgroup float shared[8];
+    \\
+    \\    device const float* q_head = q + head * head_dim;
+    \\    device const float* k_head = k_cache + head * max_seq * head_dim;
+    \\    device const float* v_head = v_cache + head * max_seq * head_dim;
+    \\
+    \\    for (uint kv = tid; kv < kv_len; kv += 256) {
+    \\        float score = 0.0f;
+    \\        for (uint d = 0; d < head_dim; d++) {
+    \\            score += q_head[d] * k_head[kv * head_dim + d];
+    \\        }
+    \\        shared_scores[kv] = score * scale;
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\    float local_max = -INFINITY;
+    \\    for (uint i = tid; i < kv_len; i += 256) {
+    \\        local_max = max(local_max, shared_scores[i]);
+    \\    }
+    \\    float simd_max_val = simd_max(local_max);
+    \\    if (simd_idx == 0) shared[simd_gid] = simd_max_val;
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    if (simd_gid == 0) {
+    \\        float total = (simd_idx < 8) ? shared[simd_idx] : -INFINITY;
+    \\        total = simd_max(total);
+    \\        if (simd_idx == 0) shared[0] = total;
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    float max_score = shared[0];
+    \\
+    \\    float local_sum = 0.0f;
+    \\    for (uint i = tid; i < kv_len; i += 256) {
+    \\        shared_scores[i] = exp(shared_scores[i] - max_score);
+    \\        local_sum += shared_scores[i];
+    \\    }
+    \\    float simd_sum_val = simd_sum(local_sum);
+    \\    if (simd_idx == 0) shared[simd_gid] = simd_sum_val;
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    if (simd_gid == 0) {
+    \\        float total = (simd_idx < 8) ? shared[simd_idx] : 0.0f;
+    \\        total = simd_sum(total);
+    \\        if (simd_idx == 0) shared[0] = total;
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    float sum_exp = shared[0];
+    \\
+    \\    for (uint i = tid; i < kv_len; i += 256) {
+    \\        shared_scores[i] /= sum_exp;
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\    for (uint d = tid; d < head_dim; d += 256) {
+    \\        float acc = 0.0f;
+    \\        for (uint kv = 0; kv < kv_len; kv++) {
+    \\            acc += shared_scores[kv] * v_head[kv * head_dim + d];
+    \\        }
+    \\        out[head * head_dim + d] = acc;
     \\    }
     \\}
 ;

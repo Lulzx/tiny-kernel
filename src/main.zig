@@ -1,5 +1,6 @@
 pub const metal = @import("metal/metal.zig");
 pub const kernels = @import("kernels/kernels.zig");
+pub const model = @import("model/model.zig");
 
 pub const Device = metal.Device;
 pub const CommandQueue = metal.CommandQueue;
